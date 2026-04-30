@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.omx/
+.DS_Store
+*.local
+*.log
+reelgesture-*.png
+
+# Local media and generated assets
+*.mp4
+*.mov
+*.webm
+*.m4v
+varco-assets/
+public/models/
