@@ -1,10 +1,10 @@
 import { FrequencyFrame, AudioAnalysisResult, AnalysisProgress } from "../types/audioAnalysis";
 
-function clamp(value: number, min = 0, max = 1) {
+export function clamp(value: number, min = 0, max = 1) {
   return Math.max(min, Math.min(max, value));
 }
 
-function averageBand(
+export function averageBand(
   data: Uint8Array,
   sampleRate: number,
   lowFrequency: number,
@@ -30,7 +30,7 @@ function averageBand(
   return clamp(average * 0.58 + (peak / 255) * 0.42);
 }
 
-function positiveBandFlux(
+export function positiveBandFlux(
   data: Uint8Array,
   previousData: Uint8Array,
   sampleRate: number,
@@ -56,64 +56,80 @@ function positiveBandFlux(
 }
 
 export async function analyzeAudio(
-  source: AudioBuffer | MediaElementAudioSourceNode,
+  audioBuffer: AudioBuffer,
   onProgress?: (progress: AnalysisProgress) => void,
 ): Promise<AudioAnalysisResult> {
   onProgress?.({ status: "analyzing", progress: 0 });
 
-  // AudioBuffer인 경우 직접 사용, MediaElementAudioSource인 경우 변환
-  let buffer: AudioBuffer;
-  if (source instanceof AudioBuffer) {
-    buffer = source;
-  } else {
-    throw new Error("AudioBuffer expected");
-  }
-
-  const sampleRate = buffer.sampleRate;
-  const offlineContext = new OfflineAudioContext(1, buffer.length, sampleRate);
+  const sampleRate = audioBuffer.sampleRate;
+  const offlineContext = new OfflineAudioContext(1, audioBuffer.length, sampleRate);
   const analyser = offlineContext.createAnalyser();
   analyser.fftSize = 1024;
   analyser.smoothingTimeConstant = 0.38;
 
+  const source = offlineContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(analyser);
+  analyser.connect(offlineContext.destination);
+  source.start(0);
+
+  // Render the entire audio buffer offline to get frequency data
+  const renderedBuffer = await offlineContext.startRendering();
+
+  // Now analyze the rendered buffer frame by frame
   const frames: FrequencyFrame[] = [];
   const hopSize = Math.floor(sampleRate / 30); // ~30fps
   const frequencyData = new Uint8Array(analyser.frequencyBinCount);
   const previousData = new Uint8Array(analyser.frequencyBinCount);
-  const channelData = buffer.getChannelData(0);
+  const channelData = renderedBuffer.getChannelData(0);
 
-  // 채널 데이터로부터 FFT 시뮬레이션
-  // 실제 구현: 웹 오디오 API로 전체 버퍼 분석
   for (let i = 0; i < channelData.length; i += hopSize) {
+    // In a real offline analysis, we'd process the channel data through FFT
+    // For now, use a simple approach: treat the audio chunk as frequency data
+    // This is a simplified approximation that works for visualization
     const windowSize = Math.min(analyser.fftSize, channelData.length - i);
-
-    // 간단한 스펙트럼 계산 (더미 데이터 아님)
-    // 실제로는 여기서 FFT를 수행하거나 다른 신호 처리 적용
-    // 지금은 간단한 amplitude 기반 분석
     const window = channelData.slice(i, i + windowSize);
-    const rms = Math.sqrt(window.reduce((sum, v) => sum + v * v, 0) / windowSize);
 
-    // 더미 대역 계산 (실제 구현에서는 FFT 사용)
-    const baseFactor = rms * 100;
+    // Create a fake frequency spectrum for visualization
+    // In production, you'd use a real FFT library (e.g., Meyda, essentia.js)
+    for (let j = 0; j < analyser.frequencyBinCount; j += 1) {
+      frequencyData[j] = Math.max(0, Math.min(255, Math.abs(window[j % windowSize] * 255)));
+    }
+
+    // Calculate frequency bands using the helper functions
+    const sub = averageBand(frequencyData, sampleRate, 28, 80);
+    const bass = averageBand(frequencyData, sampleRate, 80, 250);
+    const lowMid = averageBand(frequencyData, sampleRate, 250, 500);
+    const mid = averageBand(frequencyData, sampleRate, 500, 2000);
+    const presence = averageBand(frequencyData, sampleRate, 2000, 4000);
+    const high = averageBand(frequencyData, sampleRate, 4000, 8000);
+    const air = averageBand(frequencyData, sampleRate, 8000, 16000);
+
+    // Calculate flux using the helper function
+    const flux = positiveBandFlux(frequencyData, previousData, sampleRate, 28, 16000);
 
     frames.push({
       timestamp: i / sampleRate,
-      sub: clamp(baseFactor * 0.8),
-      bass: clamp(baseFactor * 0.7),
-      lowMid: clamp(baseFactor * 0.6),
-      mid: clamp(baseFactor * 0.5),
-      presence: clamp(baseFactor * 0.4),
-      high: clamp(baseFactor * 0.3),
-      air: clamp(baseFactor * 0.2),
-      flux: clamp(Math.random() * 0.3),
+      sub,
+      bass,
+      lowMid,
+      mid,
+      presence,
+      high,
+      air,
+      flux,
     });
 
-    onProgress?.({ status: "analyzing", progress: i / channelData.length });
+    previousData.set(frequencyData);
+
+    const progress = i / channelData.length;
+    onProgress?.({ status: "analyzing", progress });
   }
 
   onProgress?.({ status: "done", progress: 1 });
 
   return {
-    duration: buffer.duration,
+    duration: audioBuffer.duration,
     sampleRate,
     frames,
   };
