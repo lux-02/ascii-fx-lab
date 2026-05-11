@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "latest",
+    "fft.js": "^4.0.4",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest"

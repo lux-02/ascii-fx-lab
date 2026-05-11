@@ -1,3 +1,4 @@
+import FFT from 'fft.js';
 import { FrequencyFrame, AudioAnalysisResult, AnalysisProgress } from "../types/audioAnalysis";
 
 export function clamp(value: number, min = 0, max = 1) {
@@ -62,41 +63,42 @@ export async function analyzeAudio(
   onProgress?.({ status: "analyzing", progress: 0 });
 
   const sampleRate = audioBuffer.sampleRate;
-  const offlineContext = new OfflineAudioContext(1, audioBuffer.length, sampleRate);
-  const analyser = offlineContext.createAnalyser();
-  analyser.fftSize = 1024;
-  analyser.smoothingTimeConstant = 0.38;
-
-  const source = offlineContext.createBufferSource();
-  source.buffer = audioBuffer;
-  source.connect(analyser);
-  analyser.connect(offlineContext.destination);
-  source.start(0);
-
-  // Render the entire audio buffer offline to get frequency data
-  const renderedBuffer = await offlineContext.startRendering();
-
-  // Now analyze the rendered buffer frame by frame
   const frames: FrequencyFrame[] = [];
   const hopSize = Math.floor(sampleRate / 30); // ~30fps
-  const frequencyData = new Uint8Array(analyser.frequencyBinCount);
-  const previousData = new Uint8Array(analyser.frequencyBinCount);
-  const channelData = renderedBuffer.getChannelData(0);
+  const fftSize = 1024;
+  const fft = new FFT(fftSize);
+
+  const channelData = audioBuffer.getChannelData(0);
+  const frequencyData = new Uint8Array(fftSize / 2);
+  const previousData = new Uint8Array(fftSize / 2);
+
+  // Hann window for better frequency analysis
+  const window = new Float32Array(fftSize);
+  for (let i = 0; i < fftSize; i += 1) {
+    window[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (fftSize - 1)));
+  }
 
   for (let i = 0; i < channelData.length; i += hopSize) {
-    // In a real offline analysis, we'd process the channel data through FFT
-    // For now, use a simple approach: treat the audio chunk as frequency data
-    // This is a simplified approximation that works for visualization
-    const windowSize = Math.min(analyser.fftSize, channelData.length - i);
-    const window = channelData.slice(i, i + windowSize);
-
-    // Create a fake frequency spectrum for visualization
-    // In production, you'd use a real FFT library (e.g., Meyda, essentia.js)
-    for (let j = 0; j < analyser.frequencyBinCount; j += 1) {
-      frequencyData[j] = Math.max(0, Math.min(255, Math.abs(window[j % windowSize] * 255)));
+    // Extract and window the audio frame
+    const frame = new Float32Array(fftSize);
+    for (let j = 0; j < fftSize; j += 1) {
+      const idx = i + j;
+      frame[j] = (idx < channelData.length ? channelData[idx] : 0) * window[j];
     }
 
-    // Calculate frequency bands using the helper functions
+    // Perform FFT
+    const spectrum = fft.createComplexArray();
+    fft.realTransform(spectrum, frame);
+
+    // Convert complex spectrum to magnitude (0-255 scale)
+    for (let j = 0; j < fftSize / 2; j += 1) {
+      const real = spectrum[2 * j] ?? 0;
+      const imag = spectrum[2 * j + 1] ?? 0;
+      const magnitude = Math.sqrt(real * real + imag * imag);
+      frequencyData[j] = Math.max(0, Math.min(255, magnitude * 2));
+    }
+
+    // Calculate frequency bands using helper functions
     const sub = averageBand(frequencyData, sampleRate, 28, 80);
     const bass = averageBand(frequencyData, sampleRate, 80, 250);
     const lowMid = averageBand(frequencyData, sampleRate, 250, 500);
@@ -105,7 +107,7 @@ export async function analyzeAudio(
     const high = averageBand(frequencyData, sampleRate, 4000, 8000);
     const air = averageBand(frequencyData, sampleRate, 8000, 16000);
 
-    // Calculate flux using the helper function
+    // Calculate flux using helper function
     const flux = positiveBandFlux(frequencyData, previousData, sampleRate, 28, 16000);
 
     frames.push({
