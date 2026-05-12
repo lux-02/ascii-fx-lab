@@ -1,5 +1,6 @@
-import { Camera, FileVideo, Hand, RotateCcw, Upload } from "lucide-react";
+import { Camera, FileVideo, Hand, RotateCcw, Sparkles, Upload } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AsciiVideoPage } from "./AsciiVideoPage";
 import {
   DrawingUtils,
   FilesetResolver,
@@ -598,6 +599,11 @@ function ReelGesturePage() {
     <main className="shell">
       <section className="workspace" aria-label="ReelGesture workspace">
         <aside className="control-panel">
+          <a className="page-link" href="/ascii">
+            <Sparkles size={15} aria-hidden="true" />
+            ASCII Lab
+          </a>
+
           <input
             ref={fileInputRef}
             className="file-input"
@@ -712,5 +718,7 @@ function ReelGesturePage() {
 }
 
 export default function App() {
+  if (window.location.pathname.replace(/\/$/, "") === "/ascii") return <AsciiVideoPage />;
+
   return <ReelGesturePage />;
 }
