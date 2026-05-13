@@ -3,6 +3,7 @@ import { FrequencyFrame, AudioAnalysisResult } from "../types/audioAnalysis";
 
 export function useFrequencyBands(analysisResult: AudioAnalysisResult | null) {
   const analysisRef = useRef(analysisResult);
+  analysisRef.current = analysisResult;
 
   const getFrameAtTime = useCallback((time: number): FrequencyFrame | null => {
     if (!analysisRef.current) return null;
