@@ -472,7 +472,7 @@ function ReelGesturePage() {
       rafRef.current = window.requestAnimationFrame(processWebcamFrame);
     } catch (error) {
       setCameraState("error");
-      setCameraError(error instanceof Error ? error.message : "웹캠 권한 또는 모델 로딩을 확인하세요.");
+      setCameraError(error instanceof Error ? error.message : "Check webcam permission or model loading.");
     }
   }, [cameraState, processWebcamFrame]);
 
@@ -599,7 +599,7 @@ function ReelGesturePage() {
     <main className="shell">
       <section className="workspace" aria-label="ReelGesture workspace">
         <aside className="control-panel">
-          <a className="page-link" href="/ascii">
+          <a className="page-link" href="/">
             <Sparkles size={15} aria-hidden="true" />
             ASCII Lab
           </a>
@@ -617,22 +617,22 @@ function ReelGesturePage() {
 
           <button className="upload-zone" type="button" onClick={() => fileInputRef.current?.click()}>
             <Upload size={18} aria-hidden="true" />
-            <span>영상 업로드</span>
+            <span>Upload Video</span>
             <small>{clipStatus}</small>
           </button>
 
           <div className="button-grid">
             <button className="primary" type="button" onClick={startCamera} disabled={cameraState === "loading"}>
               <Camera size={17} aria-hidden="true" />
-              {cameraState === "ready" ? "웹캠 실행 중" : "웹캠 시작"}
+              {cameraState === "ready" ? "Webcam Running" : "Start Webcam"}
             </button>
             <button type="button" onClick={resetActiveFrame} disabled={!clip}>
               <RotateCcw size={17} aria-hidden="true" />
-              첫 프레임
+              First Frame
             </button>
             <button type="button" onClick={moveToEndFrame} disabled={!clip || !activeFramesReady}>
               <Hand size={17} aria-hidden="true" />
-              끝 프레임 전환
+              Jump To End
             </button>
           </div>
 
@@ -654,14 +654,14 @@ function ReelGesturePage() {
               <strong>{clip && !clipReady ? "loading" : frameState}</strong>
             </div>
           </div>
-          <div className="frame-meter" aria-label="프레임 전환 진행률">
+          <div className="frame-meter" aria-label="Frame transition progress">
             <span style={{ width: `${frameProgress}%` }} />
           </div>
 
-          <div className="clip-status" aria-label="현재 영상">
+          <div className="clip-status" aria-label="Current clip">
             <FileVideo size={15} aria-hidden="true" />
             <span>
-              <strong>{clip?.name ?? "업로드한 영상이 없습니다."}</strong>
+              <strong>{clip?.name ?? "No video uploaded."}</strong>
               <em>{clipStatus}</em>
             </span>
           </div>
@@ -718,7 +718,8 @@ function ReelGesturePage() {
 }
 
 export default function App() {
-  if (window.location.pathname.replace(/\/$/, "") === "/ascii") return <AsciiVideoPage />;
+  const pathname = window.location.pathname.replace(/\/$/, "");
+  if (pathname === "/gesture") return <ReelGesturePage />;
 
-  return <ReelGesturePage />;
+  return <AsciiVideoPage />;
 }

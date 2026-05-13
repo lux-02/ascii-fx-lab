@@ -1,9 +1,7 @@
 import {
-  Download,
   FileVideo,
   Pause,
   Play,
-  Radio,
   RotateCcw,
   SlidersHorizontal,
   Sparkles,
@@ -11,11 +9,22 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { analyzeAudio } from "./services/audioAnalysis";
+import { useFrequencyBands } from "./hooks/useFrequencyBands";
+import type { AudioAnalysisResult, AnalysisProgress } from "./types/audioAnalysis";
+
+type WindowWithWebkit = Window & { webkitAudioContext?: typeof AudioContext };
+
 type AsciiMode = "dots" | "matrix" | "edges" | "poster";
+type AsciiPolarity = "audio" | "positive" | "negative";
+type AsciiViewMode = "split" | "overlay";
 type EffectFilterId = "silver" | "thermal" | "matrix" | "edge" | "whiteout" | "redline";
+type GlyphMode = "auto" | "dot" | "ascii" | "block" | "binary" | "edge";
+type ResolvedGlyphMode = Exclude<GlyphMode, "auto">;
 type AudioProfile = "idle" | "kick" | "bassline" | "snare" | "hat" | "lead" | "pad";
-type ProfileFilterMap = Record<AudioProfile, EffectFilterId>;
-type RecordingState = "idle" | "recording" | "stopping";
+type FrequencyRouteBand = "idle" | "sub" | "bass" | "mid" | "presence" | "high" | "air" | "flux" | "beat";
+type FrequencyFilterMap = Record<FrequencyRouteBand, EffectFilterId>;
+type FilterPolarityMap = Record<EffectFilterId, AsciiPolarity>;
 type Rgb = [number, number, number];
 
 type FilterCandidate = {
@@ -51,8 +60,14 @@ type AsciiSettings = {
   contrast: number;
   density: number;
   filter: EffectFilter;
+  glyphMode: GlyphMode;
+  overlayStrength: number;
+  pixelSize: number;
+  polarity: AsciiPolarity;
   reactivity: number;
+  sourceLevel: number;
   transitionSmooth: number;
+  viewMode: AsciiViewMode;
 };
 
 type EffectFilter = {
@@ -224,24 +239,69 @@ const effectFilters: EffectFilter[] = [
 
 const defaultEffectFilter = effectFilters[0];
 
-const profileOptions: Array<{ label: string; profile: AudioProfile }> = [
-  { label: "Idle", profile: "idle" },
-  { label: "Kick", profile: "kick" },
-  { label: "Bass", profile: "bassline" },
-  { label: "Snare", profile: "snare" },
-  { label: "Hat", profile: "hat" },
-  { label: "Lead", profile: "lead" },
-  { label: "Pad", profile: "pad" },
+const frequencyRouteOptions: Array<{ band: FrequencyRouteBand; label: string }> = [
+  { band: "idle", label: "Idle" },
+  { band: "sub", label: "Sub" },
+  { band: "bass", label: "Bass" },
+  { band: "mid", label: "Mid" },
+  { band: "presence", label: "Presence" },
+  { band: "high", label: "High" },
+  { band: "air", label: "Air" },
+  { band: "flux", label: "Flux" },
+  { band: "beat", label: "Beat" },
 ];
 
-const defaultProfileFilterMap: ProfileFilterMap = {
-  bassline: "thermal",
-  hat: "whiteout",
+const defaultFrequencyFilterMap: FrequencyFilterMap = {
+  air: "whiteout",
+  bass: "thermal",
+  beat: "redline",
+  flux: "edge",
+  high: "edge",
   idle: "silver",
-  kick: "redline",
-  lead: "matrix",
-  pad: "silver",
-  snare: "edge",
+  mid: "matrix",
+  presence: "matrix",
+  sub: "redline",
+};
+
+const defaultFilterPolarityMap: FilterPolarityMap = {
+  edge: "positive",
+  matrix: "positive",
+  redline: "positive",
+  silver: "positive",
+  thermal: "positive",
+  whiteout: "positive",
+};
+
+const polarityOptions: Array<{ label: string; value: AsciiPolarity }> = [
+  { label: "Positive", value: "positive" },
+  { label: "Negative", value: "negative" },
+  { label: "Beat", value: "audio" },
+];
+
+const glyphModeOptions: Array<{ label: string; value: GlyphMode }> = [
+  { label: "Auto", value: "auto" },
+  { label: "Dot", value: "dot" },
+  { label: "ASCII", value: "ascii" },
+  { label: "Block", value: "block" },
+  { label: "Binary", value: "binary" },
+  { label: "Edge", value: "edge" },
+];
+
+const defaultGlyphModeByFilter: Record<EffectFilterId, ResolvedGlyphMode> = {
+  edge: "edge",
+  matrix: "binary",
+  redline: "block",
+  silver: "dot",
+  thermal: "block",
+  whiteout: "ascii",
+};
+
+const glyphCharacters: Record<ResolvedGlyphMode, string> = {
+  ascii: " .:-=+*#%@",
+  binary: "01",
+  block: "░▒▓█",
+  dot: "",
+  edge: "/\\|_-",
 };
 
 function clamp(value: number, min = 0, max = 1) {
@@ -302,6 +362,22 @@ function getEffectFilter(id: EffectFilterId) {
   return effectFilters.find((filter) => filter.id === id) ?? defaultEffectFilter;
 }
 
+function resolveGlyphMode(mode: GlyphMode, filterId: EffectFilterId): ResolvedGlyphMode {
+  return mode === "auto" ? defaultGlyphModeByFilter[filterId] : mode;
+}
+
+function getGlyphModeLabel(mode: GlyphMode | ResolvedGlyphMode) {
+  return glyphModeOptions.find((option) => option.value === mode)?.label ?? mode;
+}
+
+function getIdleRouteFilter(frequencyFilterMap: FrequencyFilterMap) {
+  return getEffectFilter(frequencyFilterMap.idle);
+}
+
+function isFrequencyRoutedFilter(filterId: EffectFilterId, frequencyFilterMap: FrequencyFilterMap) {
+  return Object.values(frequencyFilterMap).includes(filterId);
+}
+
 function getProfileLabel(profile: AudioProfile) {
   if (profile === "kick") return "Kick";
   if (profile === "bassline") return "Bass";
@@ -340,27 +416,43 @@ function detectAudioProfile(bands: Omit<AudioBands, "profile" | "profileStrength
   };
 }
 
-function pickAudioEffectFilter(bands: AudioBands, reactivity: number, profileFilterMap: ProfileFilterMap) {
-  const sensitivity = clamp(reactivity);
-  if (bands.profile !== "idle" && bands.profileStrength > 0.2 - sensitivity * 0.04) {
-    return getEffectFilter(profileFilterMap[bands.profile]);
+function pickDominantFrequencyBand(bands: AudioBands, reactivity: number): { band: FrequencyRouteBand; value: number } {
+  const candidates: Array<{ band: Exclude<FrequencyRouteBand, "idle">; value: number }> = [
+    { band: "sub", value: bands.sub },
+    { band: "bass", value: bands.bass },
+    { band: "mid", value: Math.max(bands.mid, bands.lowMid * 0.85) },
+    { band: "presence", value: bands.presence },
+    { band: "high", value: bands.high },
+    { band: "air", value: bands.air },
+    { band: "flux", value: bands.flux },
+    { band: "beat", value: bands.beat },
+  ];
+
+  const dominant = candidates.reduce((best, next) => (next.value > best.value ? next : best), candidates[0]);
+  const idleThreshold = 0.055 - clamp(reactivity) * 0.025;
+  if (Math.max(dominant.value, bands.level, bands.flux) < idleThreshold) {
+    return { band: "idle", value: 0 };
   }
-  if (bands.beat > 0.48 - sensitivity * 0.18 && bands.bass > 0.18) return getEffectFilter("redline");
-  if (bands.high > 0.22 - sensitivity * 0.08 && bands.high > bands.mid * 1.02) return getEffectFilter("whiteout");
-  if (bands.high > 0.17 - sensitivity * 0.06 && bands.high > bands.bass * 0.62) return getEffectFilter("edge");
-  if (bands.bass > 0.2 - sensitivity * 0.06 && bands.bass > bands.mid * 1.45) return getEffectFilter("thermal");
-  if (bands.mid > 0.13 - sensitivity * 0.04 && bands.mid > bands.bass * 0.58) return getEffectFilter("matrix");
-  if (bands.bass > 0.2 - sensitivity * 0.06) return getEffectFilter("thermal");
-  return getEffectFilter("silver");
+
+  return dominant;
+}
+
+function pickAudioEffectFilter(
+  bands: AudioBands,
+  reactivity: number,
+  frequencyFilterMap: FrequencyFilterMap,
+) {
+  const dominant = pickDominantFrequencyBand(bands, reactivity);
+  return getEffectFilter(frequencyFilterMap[dominant.band]);
 }
 
 function buildReactiveEffectFilter(
   base: EffectFilter,
   bands: AudioBands,
   reactivity: number,
-  profileFilterMap: ProfileFilterMap,
+  frequencyFilterMap: FrequencyFilterMap,
 ) {
-  const target = pickAudioEffectFilter(bands, reactivity, profileFilterMap);
+  const target = pickAudioEffectFilter(bands, reactivity, frequencyFilterMap);
   const dominantBand = Math.max(bands.sub, bands.bass, bands.mid, bands.presence, bands.high, bands.air, bands.beat);
   const morph = clamp(
     (dominantBand - 0.04) * (1.45 + reactivity * 1.8) +
@@ -444,72 +536,52 @@ function drawCover(
   context.drawImage(source, sourceX, sourceY, scaledWidth, scaledHeight, x, y, width, height);
 }
 
-function averageBand(
-  data: Uint8Array<ArrayBuffer>,
-  sampleRate: number,
-  lowFrequency: number,
-  highFrequency: number,
-) {
-  if (!data.length) return 0;
-
-  const nyquist = sampleRate / 2;
-  const start = Math.max(0, Math.floor((lowFrequency / nyquist) * data.length));
-  const end = Math.min(data.length - 1, Math.ceil((highFrequency / nyquist) * data.length));
-
-  if (end <= start) return 0;
-
-  let sum = 0;
-  let peak = 0;
-  for (let index = start; index <= end; index += 1) {
-    const value = data[index] ?? 0;
-    sum += value;
-    peak = Math.max(peak, value);
-  }
-
-  const average = sum / ((end - start + 1) * 255);
-  return clamp(average * 0.58 + (peak / 255) * 0.42);
-}
-
-function positiveBandFlux(
-  data: Uint8Array<ArrayBuffer>,
-  previousData: Uint8Array<ArrayBuffer>,
-  sampleRate: number,
-  lowFrequency: number,
-  highFrequency: number,
-) {
-  if (!data.length || previousData.length !== data.length) return 0;
-
-  const nyquist = sampleRate / 2;
-  const start = Math.max(0, Math.floor((lowFrequency / nyquist) * data.length));
-  const end = Math.min(data.length - 1, Math.ceil((highFrequency / nyquist) * data.length));
-  if (end <= start) return 0;
-
-  let sum = 0;
-  let peak = 0;
-  for (let index = start; index <= end; index += 1) {
-    const diff = Math.max(0, (data[index] ?? 0) - (previousData[index] ?? 0));
-    sum += diff;
-    peak = Math.max(peak, diff);
-  }
-
-  return clamp((sum / ((end - start + 1) * 255)) * 0.68 + (peak / 255) * 0.32);
-}
-
-function getRecorderMimeType() {
-  const preferredTypes = [
-    "video/webm;codecs=vp9,opus",
-    "video/webm;codecs=vp8,opus",
-    "video/webm",
-  ];
-
-  return preferredTypes.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
-}
-
 function readLuminance(pixels: Uint8ClampedArray, index: number) {
   const red = pixels[index] ?? 0;
   const green = pixels[index + 1] ?? 0;
   const blue = pixels[index + 2] ?? 0;
   return red * 0.2126 + green * 0.7152 + blue * 0.0722;
+}
+
+function pickGlyph(mode: Exclude<ResolvedGlyphMode, "dot">, intensity: number, column: number, row: number, seed: number) {
+  const characters = glyphCharacters[mode];
+  if (!characters.length) return "";
+
+  if (mode === "binary" || mode === "edge") {
+    const index = Math.abs(Math.floor(seed * 0.03 + column * 17 + row * 31 + intensity * 11)) % characters.length;
+    return characters[index] ?? characters[0] ?? "";
+  }
+
+  const index = Math.min(characters.length - 1, Math.max(0, Math.round(clamp(intensity) * (characters.length - 1))));
+  return characters[index] ?? characters[characters.length - 1] ?? "";
+}
+
+function drawGlyph(
+  context: CanvasRenderingContext2D,
+  mode: ResolvedGlyphMode,
+  glyph: string,
+  x: number,
+  y: number,
+  cellWidth: number,
+  cellHeight: number,
+  alpha: number,
+  color: Rgb,
+) {
+  if (mode === "dot") {
+    const radius = Math.max(0.9, Math.min(cellWidth, cellHeight) * (0.16 + alpha * 0.28));
+    context.fillStyle = rgba(color, 0.14 + alpha * 0.76);
+    context.beginPath();
+    context.arc(x, y, radius, 0, Math.PI * 2);
+    context.fill();
+    return;
+  }
+
+  const fontSize = Math.max(5, Math.min(cellWidth * 1.18, cellHeight * 1.24));
+  context.fillStyle = rgba(color, 0.22 + alpha * 0.72);
+  context.font = `${fontSize}px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace`;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(glyph, x, y);
 }
 
 function drawMatrixRain(
@@ -518,14 +590,23 @@ function drawMatrixRain(
   height: number,
   bands: AudioBands,
   filter: EffectFilter,
+  pixelSize: number,
+  glyphMode: ResolvedGlyphMode,
+  beatInvert: boolean,
   seed: number,
 ) {
-  const columns = Math.max(48, Math.round(width / 9));
+  const cellTarget = mixNumber(6.2, 15.2, pixelSize);
+  const columns = Math.max(30, Math.round(width / cellTarget));
   const cellWidth = width / columns;
   const rows = Math.ceil(height / Math.max(5, cellWidth * 1.2));
   const glow = 0.28 + bands.high * 0.56;
 
-  const background = mixRgb(filter.background, filter.flashColor, bands.bass * filter.flashGain * 0.38);
+  const background = mixRgb(
+    beatInvert ? filter.invertBackground : filter.background,
+    filter.flashColor,
+    bands.bass * filter.flashGain * 0.38,
+  );
+  const ink = beatInvert ? filter.invertInk : filter.ink;
 
   context.fillStyle = rgb(background);
   context.fillRect(0, 0, width, height);
@@ -540,10 +621,16 @@ function drawMatrixRain(
 
       const x = column * cellWidth + cellWidth * 0.5;
       const y = row * cellWidth * 1.2 + cellWidth * 0.55;
-      context.fillStyle = rgba(filter.ink, alpha);
-      context.beginPath();
-      context.arc(x, y, Math.max(1.1, cellWidth * (0.1 + alpha * 0.24)), 0, Math.PI * 2);
-      context.fill();
+      if (glyphMode === "dot") {
+        context.fillStyle = rgba(ink, alpha);
+        context.beginPath();
+        context.arc(x, y, Math.max(1.1, cellWidth * (0.1 + alpha * 0.24)), 0, Math.PI * 2);
+        context.fill();
+      } else {
+        const matrixGlyphMode = glyphMode === "ascii" || glyphMode === "block" ? glyphMode : "binary";
+        const glyph = pickGlyph(matrixGlyphMode, alpha, column, row, seed);
+        drawGlyph(context, matrixGlyphMode, glyph, x, y, cellWidth, cellWidth * 1.2, alpha, ink);
+      }
     }
   }
 }
@@ -558,8 +645,6 @@ function drawModulationOverlays(
 ) {
   const kickPulse = clamp(bands.sub * 0.55 + bands.beat * 0.5 + bands.transient * 0.36);
   const hatSpark = clamp(bands.air * 0.92 + bands.high * 0.42 + bands.flux * 0.32);
-  const snareSnap = bands.profile === "snare" ? bands.profileStrength : clamp(bands.presence * 0.45 + bands.flux * 0.45);
-  const leadFlow = bands.profile === "lead" ? bands.profileStrength : clamp(bands.presence * 0.55 + bands.mid * 0.25);
   const flashScale = 1 - filter.flashGain * 0.08;
 
   if (kickPulse > 0.08) {
@@ -578,15 +663,6 @@ function drawModulationOverlays(
     context.fillRect(0, 0, width, height);
   }
 
-  if (snareSnap > 0.1) {
-    const lineCount = Math.round(8 + snareSnap * 18);
-    context.fillStyle = rgba(filter.invertInk, 0.035 + snareSnap * 0.12);
-    for (let index = 0; index < lineCount; index += 1) {
-      const y = ((seed * (0.16 + snareSnap * 0.08) + index * height * 0.071) % height) | 0;
-      context.fillRect(0, y, width, Math.max(1, height * 0.0025));
-    }
-  }
-
   if (hatSpark > 0.08) {
     const count = Math.round(18 + hatSpark * 110);
     context.fillStyle = rgba(filter.invertInk, 0.2 + hatSpark * 0.5);
@@ -597,21 +673,6 @@ function drawModulationOverlays(
       context.beginPath();
       context.arc(x, y, radius, 0, Math.PI * 2);
       context.fill();
-    }
-  }
-
-  if (leadFlow > 0.08) {
-    context.strokeStyle = rgba(filter.bottomHigh, 0.08 + leadFlow * 0.2);
-    context.lineWidth = Math.max(1, width * 0.0018);
-    for (let index = 0; index < 5; index += 1) {
-      const y = height * (0.2 + index * 0.12) + Math.sin(seed * 0.018 + index * 1.7) * height * 0.028 * leadFlow;
-      context.beginPath();
-      for (let x = 0; x <= width; x += width / 18) {
-        const wave = Math.sin(seed * 0.02 + x * 0.018 + index * 2.3) * height * 0.018 * leadFlow;
-        if (x === 0) context.moveTo(x, y + wave);
-        else context.lineTo(x, y + wave);
-      }
-      context.stroke();
     }
   }
 
@@ -637,8 +698,11 @@ function drawAsciiTop(
 
   const filter = settings.filter;
   const mode = filter.mode;
+  const glyphMode = resolveGlyphMode(settings.glyphMode, filter.id);
   const dynamicDensity = clamp(settings.density + filter.densityBoost + bands.mid * 0.34, 0.18, 1);
-  const columns = Math.round(54 + dynamicDensity * 124);
+  const pixelSize = clamp(settings.pixelSize);
+  const pixelScale = mixNumber(1.34, 0.66, pixelSize);
+  const columns = Math.max(32, Math.round((54 + dynamicDensity * 124) * pixelScale));
   const rows = Math.max(18, Math.round(columns * (height / width) * 1.08));
 
   if (sampleCanvas.width !== columns || sampleCanvas.height !== rows) {
@@ -653,11 +717,13 @@ function drawAsciiTop(
   const cellHeight = height / rows;
   const minCell = Math.min(cellWidth, cellHeight);
   const bassFlash = clamp((bands.bass - 0.28) / 0.72) * filter.flashGain;
-  const beatInvert = bands.beat > filter.invertThreshold;
+  const beatInvert =
+    settings.polarity === "negative" ||
+    (settings.polarity === "audio" && bands.beat > filter.invertThreshold);
   const background = mixRgb(filter.background, filter.flashColor, bassFlash);
 
   if (mode === "matrix") {
-    drawMatrixRain(context, width, height, bands, filter, seed);
+    drawMatrixRain(context, width, height, bands, filter, pixelSize, glyphMode, beatInvert, seed);
   } else if (mode === "poster") {
     context.fillStyle = beatInvert ? rgb(filter.invertBackground) : rgb(background);
     context.fillRect(0, 0, width, height);
@@ -698,9 +764,13 @@ function drawAsciiTop(
 
   const effectiveContrast = clamp(settings.contrast + filter.contrastBoost);
   const threshold = 0.42 - effectiveContrast * 0.16 - bands.mid * 0.08;
+  const lightInkColor = beatInvert ? filter.invertInk : filter.ink;
+  const ghostInkColor = filter.ghost;
   const lightInk = beatInvert ? rgba(filter.invertInk, 0.9) : rgba(filter.ink, 0.9);
   const darkInk = beatInvert ? rgba(filter.ink, 0.78) : rgba(filter.mask, mode === "poster" ? 0.42 : 0.9);
-  const maskFill = mode === "matrix" ? rgba(filter.mask, 0.96) : darkInk;
+  const maskFill = mode === "matrix"
+    ? rgba(beatInvert ? filter.invertBackground : filter.mask, 0.96)
+    : darkInk;
 
   for (let row = 0; row < rows; row += 1) {
     for (let column = 0; column < columns; column += 1) {
@@ -733,10 +803,16 @@ function drawAsciiTop(
       const x = column * cellWidth + cellWidth * 0.5 + jitterX;
       const y = row * cellHeight + cellHeight * 0.5 + jitterY;
 
-      context.fillStyle = silhouette ? lightInk : rgba(filter.ghost, 0.14 + bands.high * filter.noise * 0.54);
-      context.beginPath();
-      context.arc(x, y, radius, 0, Math.PI * 2);
-      context.fill();
+      if (glyphMode === "dot") {
+        context.fillStyle = silhouette ? lightInk : rgba(filter.ghost, 0.14 + bands.high * filter.noise * 0.54);
+        context.beginPath();
+        context.arc(x, y, radius, 0, Math.PI * 2);
+        context.fill();
+      } else {
+        const glyph = pickGlyph(glyphMode, intensity, column, row, seed);
+        const glyphColor = silhouette ? lightInkColor : ghostInkColor;
+        drawGlyph(context, glyphMode, glyph, x, y, cellWidth, cellHeight, intensity, glyphColor);
+      }
     }
   }
 }
@@ -748,134 +824,135 @@ export function AsciiVideoPage() {
   const [clip, setClip] = useState<AsciiClip | null>(null);
   const [contrast, setContrast] = useState(0.58);
   const [density, setDensity] = useState(0.64);
-  const [exportUrl, setExportUrl] = useState("");
+  const [frequencyFilterMap, setFrequencyFilterMap] = useState<FrequencyFilterMap>(defaultFrequencyFilterMap);
+  const [glyphMode, setGlyphMode] = useState<GlyphMode>("auto");
   const [isPlaying, setIsPlaying] = useState(false);
-  const [profileFilterMap, setProfileFilterMap] = useState<ProfileFilterMap>(defaultProfileFilterMap);
+  const [filterPolarityMap, setFilterPolarityMap] = useState<FilterPolarityMap>(defaultFilterPolarityMap);
+  const [overlayStrength, setOverlayStrength] = useState(0.9);
+  const [pixelSize, setPixelSize] = useState(0.5);
   const [reactivity, setReactivity] = useState(0.82);
-  const [recordingState, setRecordingState] = useState<RecordingState>("idle");
+  const [sourceLevel, setSourceLevel] = useState(0.7);
+  const [analysisResult, setAnalysisResult] = useState<AudioAnalysisResult | null>(null);
+  const [displayProgress, setDisplayProgress] = useState<AnalysisProgress>({ status: "idle", progress: 0 });
   const [transitionSmooth, setTransitionSmooth] = useState(0.72);
+  const [viewMode, setViewMode] = useState<AsciiViewMode>("split");
+
+  const { interpolateFrames } = useFrequencyBands(analysisResult);
 
   const activeFilter = getEffectFilter(activeFilterId);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const audioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   const activeFilterRef = useRef<EffectFilter>(defaultEffectFilter);
   const autoFilterRef = useRef(true);
   const bandsRef = useRef<AudioBands>(emptyBands);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const clipUrlRef = useRef("");
-  const exportUrlRef = useRef("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const filterCandidateRef = useRef<FilterCandidate>({ id: defaultEffectFilter.id, since: 0 });
-  const frequencyDataRef = useRef<Uint8Array<ArrayBuffer>>(new Uint8Array(0));
-  const lastBandUiUpdateRef = useRef(0);
+  const filterPolarityMapRef = useRef<FilterPolarityMap>(defaultFilterPolarityMap);
+  const frequencyFilterMapRef = useRef<FrequencyFilterMap>(defaultFrequencyFilterMap);
+  const fullscreenViewRef = useRef<"generated" | null>(null);
   const lastFilterSwitchRef = useRef(0);
-  const profileFilterMapRef = useRef<ProfileFilterMap>(defaultProfileFilterMap);
-  const previousFrequencyDataRef = useRef<Uint8Array<ArrayBuffer>>(new Uint8Array(0));
+  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const reactivityRef = useRef(reactivity);
   const renderedFilterRef = useRef<EffectFilter>(defaultEffectFilter);
   const visualBandsRef = useRef<AudioBands>(emptyBands);
-  const recordedChunksRef = useRef<Blob[]>([]);
-  const recorderRef = useRef<MediaRecorder | null>(null);
   const sampleCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const settingsRef = useRef<AsciiSettings>({
     contrast,
     density,
     filter: defaultEffectFilter,
+    glyphMode,
+    overlayStrength,
+    pixelSize,
+    polarity: defaultFilterPolarityMap[defaultEffectFilter.id],
     reactivity,
+    sourceLevel,
     transitionSmooth,
+    viewMode,
   });
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     activeFilterRef.current = activeFilter;
+    filterPolarityMapRef.current = filterPolarityMap;
     reactivityRef.current = reactivity;
-    settingsRef.current = { contrast, density, filter: activeFilter, reactivity, transitionSmooth };
-  }, [activeFilter, contrast, density, reactivity, transitionSmooth]);
+    const polarity = filterPolarityMap[activeFilterId];
+    settingsRef.current = {
+      contrast,
+      density,
+      filter: activeFilter,
+      glyphMode,
+      overlayStrength,
+      pixelSize,
+      polarity,
+      reactivity,
+      sourceLevel,
+      transitionSmooth,
+      viewMode,
+    };
+  }, [
+    activeFilter,
+    activeFilterId,
+    contrast,
+    density,
+    filterPolarityMap,
+    glyphMode,
+    overlayStrength,
+    pixelSize,
+    reactivity,
+    sourceLevel,
+    transitionSmooth,
+    viewMode,
+  ]);
 
   useEffect(() => {
     autoFilterRef.current = autoFilter;
+    if (!autoFilter) return;
+
+    const routeMap = frequencyFilterMapRef.current;
+    if (isFrequencyRoutedFilter(activeFilterRef.current.id, routeMap)) return;
+
+    const nextFilter = getIdleRouteFilter(routeMap);
+    activeFilterRef.current = nextFilter;
+    filterCandidateRef.current = { id: nextFilter.id, since: performance.now() };
+    setActiveFilterId(nextFilter.id);
   }, [autoFilter]);
 
   useEffect(() => {
-    profileFilterMapRef.current = profileFilterMap;
-  }, [profileFilterMap]);
+    frequencyFilterMapRef.current = frequencyFilterMap;
+    if (!autoFilterRef.current || isFrequencyRoutedFilter(activeFilterRef.current.id, frequencyFilterMap)) return;
 
-  const readAudioBands = useCallback(() => {
-    const analyser = analyserRef.current;
-    if (!analyser) return bandsRef.current;
+    const nextFilter = getIdleRouteFilter(frequencyFilterMap);
+    activeFilterRef.current = nextFilter;
+    filterCandidateRef.current = { id: nextFilter.id, since: performance.now() };
+    setActiveFilterId(nextFilter.id);
+  }, [frequencyFilterMap]);
 
-    if (frequencyDataRef.current.length !== analyser.frequencyBinCount) {
-      frequencyDataRef.current = new Uint8Array(analyser.frequencyBinCount);
-    }
-    if (previousFrequencyDataRef.current.length !== analyser.frequencyBinCount) {
-      previousFrequencyDataRef.current = new Uint8Array(analyser.frequencyBinCount);
-    }
+  useEffect(() => {
+    if (!isPlaying) return;
 
-    const frequencyData = frequencyDataRef.current;
-    const previousFrequencyData = previousFrequencyDataRef.current;
-    analyser.getByteFrequencyData(frequencyData);
-
-    const sampleRate = audioContextRef.current?.sampleRate ?? 44100;
-    const sub = averageBand(frequencyData, sampleRate, 28, 80);
-    const bass = averageBand(frequencyData, sampleRate, 55, 180);
-    const lowMid = averageBand(frequencyData, sampleRate, 180, 520);
-    const mid = averageBand(frequencyData, sampleRate, 520, 1800);
-    const presence = averageBand(frequencyData, sampleRate, 1800, 4200);
-    const high = averageBand(frequencyData, sampleRate, 4200, 9200);
-    const air = averageBand(frequencyData, sampleRate, 9200, 16000);
-    const bassFlux = positiveBandFlux(frequencyData, previousFrequencyData, sampleRate, 28, 180);
-    const midFlux = positiveBandFlux(frequencyData, previousFrequencyData, sampleRate, 180, 2200);
-    const highFlux = positiveBandFlux(frequencyData, previousFrequencyData, sampleRate, 2200, 16000);
-    const flux = clamp(bassFlux * 0.38 + midFlux * 0.34 + highFlux * 0.42);
-    const transient = clamp(bassFlux * 0.46 + midFlux * 0.28 + highFlux * 0.34);
-    const level = clamp(sub * 0.18 + bass * 0.34 + lowMid * 0.18 + mid * 0.18 + presence * 0.14 + high * 0.12 + air * 0.08);
-    const previous = bandsRef.current;
-    const sensitivity = reactivityRef.current;
-    const beat =
-      (sub + bass * 0.65) > Math.max(0.28 - sensitivity * 0.08, (previous.sub + previous.bass * 0.65) * (1.15 - sensitivity * 0.08)) ||
-      transient > Math.max(0.12 - sensitivity * 0.04, previous.transient * (1.14 - sensitivity * 0.08)) ||
-      level > Math.max(0.18 - sensitivity * 0.04, previous.level * (1.18 - sensitivity * 0.08))
-        ? 1
-        : previous.beat * (0.8 - sensitivity * 0.16);
-    const blendIn = 0.46 + sensitivity * 0.34;
-    const blendOut = 1 - blendIn;
-    const smoothedBands = {
-      air: clamp(previous.air * blendOut + air * blendIn),
-      bass: clamp(previous.bass * blendOut + bass * blendIn),
-      beat: clamp(beat),
-      flux: clamp(previous.flux * blendOut + flux * blendIn),
-      high: clamp(previous.high * blendOut + high * blendIn),
-      level: clamp(previous.level * blendOut + level * blendIn),
-      lowMid: clamp(previous.lowMid * blendOut + lowMid * blendIn),
-      mid: clamp(previous.mid * blendOut + mid * blendIn),
-      presence: clamp(previous.presence * blendOut + presence * blendIn),
-      sub: clamp(previous.sub * blendOut + sub * blendIn),
-      transient: clamp(previous.transient * blendOut + transient * blendIn),
-    };
-    const profileResult = detectAudioProfile(smoothedBands);
-    const nextBands: AudioBands = {
-      ...smoothedBands,
-      profile: profileResult.profile,
-      profileStrength: clamp(previous.profileStrength * 0.42 + profileResult.profileStrength * 0.58),
-    };
-
-    previousFrequencyData.set(frequencyData);
-    bandsRef.current = nextBands;
-    return nextBands;
-  }, []);
+    const id = setInterval(() => {
+      setBands({ ...visualBandsRef.current });
+    }, 80);
+    return () => clearInterval(id);
+  }, [isPlaying]);
 
   const resolveActiveFilter = useCallback((audioBands: AudioBands, now: number) => {
     if (!autoFilterRef.current) return activeFilterRef.current;
 
     const sensitivity = reactivityRef.current;
-    const nextFilter = pickAudioEffectFilter(audioBands, sensitivity, profileFilterMapRef.current);
-    const currentFilter = activeFilterRef.current;
+    const routeMap = frequencyFilterMapRef.current;
+    const nextFilter = pickAudioEffectFilter(audioBands, sensitivity, routeMap);
+    const currentFilter = isFrequencyRoutedFilter(activeFilterRef.current.id, routeMap)
+      ? activeFilterRef.current
+      : getIdleRouteFilter(routeMap);
     const candidate = filterCandidateRef.current;
     const elapsed = now - lastFilterSwitchRef.current;
     if (candidate.id !== nextFilter.id) {
+      if (activeFilterRef.current.id !== currentFilter.id) {
+        activeFilterRef.current = currentFilter;
+        setActiveFilterId(currentFilter.id);
+      }
       filterCandidateRef.current = { id: nextFilter.id, since: now };
       return currentFilter;
     }
@@ -914,12 +991,61 @@ export function AsciiVideoPage() {
       const { width, height } = canvas;
       const topHeight = Math.round(height * 0.46);
       const bottomHeight = height - topHeight;
-      const detectedBands = readAudioBands();
+      const frame = interpolateFrames(video.currentTime);
+      const previous = bandsRef.current;
+      const reactSens = reactivityRef.current;
+      let detectedBands: AudioBands;
+
+      if (frame) {
+        const blendIn = 0.46 + reactSens * 0.34;
+        const blendOut = 1 - blendIn;
+        const smoothedFrame = {
+          air: clamp(previous.air * blendOut + frame.air * blendIn),
+          bass: clamp(previous.bass * blendOut + frame.bass * blendIn),
+          flux: clamp(previous.flux * blendOut + frame.flux * blendIn),
+          high: clamp(previous.high * blendOut + frame.high * blendIn),
+          lowMid: clamp(previous.lowMid * blendOut + frame.lowMid * blendIn),
+          mid: clamp(previous.mid * blendOut + frame.mid * blendIn),
+          presence: clamp(previous.presence * blendOut + frame.presence * blendIn),
+          sub: clamp(previous.sub * blendOut + frame.sub * blendIn),
+        };
+        const level = clamp(
+          smoothedFrame.sub * 0.18 + smoothedFrame.bass * 0.34 + smoothedFrame.lowMid * 0.18 +
+          smoothedFrame.mid * 0.18 + smoothedFrame.presence * 0.14 + smoothedFrame.high * 0.12 + smoothedFrame.air * 0.08
+        );
+        const transient = clamp(smoothedFrame.flux * 0.62 + smoothedFrame.bass * 0.22 + smoothedFrame.mid * 0.16);
+        const subBassThreshold = Math.max(0.28 - reactSens * 0.08, (previous.sub + previous.bass * 0.65) * (1.15 - reactSens * 0.08));
+        const subBassHit = (smoothedFrame.sub + smoothedFrame.bass * 0.65) > subBassThreshold;
+        const transientThreshold = Math.max(0.14 - reactSens * 0.08, previous.transient * (1.14 - reactSens * 0.08));
+        const transientHit = transient > transientThreshold;
+        const levelThreshold = Math.max(0.16 - reactSens * 0.08, previous.level * (1.18 - reactSens * 0.08));
+        const levelHit = level > levelThreshold;
+        const beatRaw = (subBassHit || transientHit || levelHit)
+          ? 1
+          : previous.beat * (0.8 - reactSens * 0.16);
+        const profileResult = detectAudioProfile({ ...smoothedFrame, beat: clamp(beatRaw), level, transient });
+        detectedBands = {
+          ...smoothedFrame,
+          beat: clamp(beatRaw),
+          level,
+          transient,
+          profile: profileResult.profile,
+          profileStrength: clamp(previous.profileStrength * 0.42 + profileResult.profileStrength * 0.58),
+        };
+        bandsRef.current = detectedBands;
+      } else {
+        detectedBands = bandsRef.current;
+      }
       const audioBands = smoothVisualBands(visualBandsRef.current, detectedBands, settingsRef.current.transitionSmooth);
       visualBandsRef.current = audioBands;
       const baseFilter = resolveActiveFilter(audioBands, now);
       const targetFilter = autoFilterRef.current
-        ? buildReactiveEffectFilter(baseFilter, audioBands, settingsRef.current.reactivity, profileFilterMapRef.current)
+        ? buildReactiveEffectFilter(
+            baseFilter,
+            audioBands,
+            settingsRef.current.reactivity,
+            frequencyFilterMapRef.current,
+          )
         : baseFilter;
       const effectFilter = smoothEffectFilterTransition(
         renderedFilterRef.current,
@@ -928,14 +1054,16 @@ export function AsciiVideoPage() {
         settingsRef.current.reactivity,
       );
       renderedFilterRef.current = effectFilter;
-      const frameSettings = { ...settingsRef.current, filter: effectFilter };
+      const frameSettings = {
+        ...settingsRef.current,
+        filter: effectFilter,
+        polarity: filterPolarityMapRef.current[effectFilter.id],
+      };
       const canDrawVideo = video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0;
-      const kickPulse = clamp(audioBands.sub * 0.5 + audioBands.beat * 0.45 + audioBands.transient * 0.32);
       const hatSpark = clamp(audioBands.air * 0.8 + audioBands.high * 0.42 + audioBands.flux * 0.28);
-      const pulseZoom = 1 + kickPulse * frameSettings.reactivity * 0.048;
       const rgbSplit = hatSpark * frameSettings.reactivity;
-      const beatShake =
-        audioBands.beat > 0.45 ? (Math.sin(now * 0.09) * width * audioBands.beat * effectFilter.jitter) / 130 : 0;
+      const isGeneratedFullscreen = document.fullscreenElement === canvas && fullscreenViewRef.current === "generated";
+      const isOverlayMode = frameSettings.viewMode === "overlay" && !isGeneratedFullscreen;
 
       context.clearRect(0, 0, width, height);
       context.fillStyle = "#000";
@@ -945,51 +1073,76 @@ export function AsciiVideoPage() {
         const sampleCanvas = sampleCanvasRef.current ?? document.createElement("canvas");
         sampleCanvasRef.current = sampleCanvas;
 
-        context.save();
-        context.translate(width * 0.5, topHeight * 0.5);
-        context.scale(pulseZoom, pulseZoom);
-        context.translate(-width * 0.5, -topHeight * 0.5);
-        context.translate(beatShake, audioBands.beat > 0.45 ? Math.cos(now * 0.08) * 3 * audioBands.beat : 0);
-        drawAsciiTop(context, video, sampleCanvas, width, topHeight, audioBands, frameSettings, now);
-        context.restore();
+        if (isGeneratedFullscreen) {
+          drawAsciiTop(context, video, sampleCanvas, width, height, audioBands, frameSettings, now);
+        } else if (isOverlayMode) {
+          context.save();
+          context.globalAlpha = clamp(frameSettings.sourceLevel, 0.35, 1);
+          drawCover(context, video, video.videoWidth, video.videoHeight, 0, 0, width, height);
+          context.restore();
 
-        context.save();
-        context.translate(width * 0.5, topHeight + bottomHeight * 0.5);
-        context.scale(1 + kickPulse * frameSettings.reactivity * 0.028, 1 + kickPulse * frameSettings.reactivity * 0.028);
-        context.translate(-width * 0.5, -(topHeight + bottomHeight * 0.5));
-        context.translate(-beatShake * 0.4, audioBands.beat > 0.45 ? Math.sin(now * 0.07) * 2 * audioBands.beat : 0);
-        drawCover(context, video, video.videoWidth, video.videoHeight, 0, topHeight, width, bottomHeight);
-        if (rgbSplit > 0.08) {
-          context.globalCompositeOperation = "screen";
-          context.globalAlpha = Math.min(0.22, rgbSplit * 0.18);
-          drawCover(context, video, video.videoWidth, video.videoHeight, width * 0.012 * rgbSplit, topHeight, width, bottomHeight);
-          context.globalAlpha = Math.min(0.18, rgbSplit * 0.14);
-          drawCover(context, video, video.videoWidth, video.videoHeight, -width * 0.01 * rgbSplit, topHeight, width, bottomHeight);
-          context.globalAlpha = 1;
-          context.globalCompositeOperation = "source-over";
+          const overlayCanvas = overlayCanvasRef.current ?? document.createElement("canvas");
+          overlayCanvasRef.current = overlayCanvas;
+          if (overlayCanvas.width !== width || overlayCanvas.height !== height) {
+            overlayCanvas.width = width;
+            overlayCanvas.height = height;
+          }
+
+          const overlayContext = overlayCanvas.getContext("2d", { alpha: true });
+          if (overlayContext) {
+            overlayContext.clearRect(0, 0, width, height);
+            const overlaySettings: AsciiSettings = {
+              ...frameSettings,
+              contrast: clamp(frameSettings.contrast + 0.14),
+              density: clamp(frameSettings.density + 0.06),
+            };
+            drawAsciiTop(overlayContext, video, sampleCanvas, width, height, audioBands, overlaySettings, now);
+            const overlayAlpha = clamp(
+              frameSettings.overlayStrength + audioBands.level * 0.08 + audioBands.high * 0.07,
+              0.28,
+              1,
+            );
+            context.save();
+            context.globalCompositeOperation = "screen";
+            context.globalAlpha = overlayAlpha;
+            context.drawImage(overlayCanvas, 0, 0);
+            context.globalCompositeOperation = "lighter";
+            context.globalAlpha = overlayAlpha * 0.16;
+            context.drawImage(overlayCanvas, 0, 0);
+            context.restore();
+          }
+        } else {
+          context.save();
+          drawAsciiTop(context, video, sampleCanvas, width, topHeight, audioBands, frameSettings, now);
+          context.restore();
+
+          context.save();
+          drawCover(context, video, video.videoWidth, video.videoHeight, 0, topHeight, width, bottomHeight);
+          if (rgbSplit > 0.08) {
+            context.globalCompositeOperation = "screen";
+            context.globalAlpha = Math.min(0.22, rgbSplit * 0.18);
+            drawCover(context, video, video.videoWidth, video.videoHeight, width * 0.012 * rgbSplit, topHeight, width, bottomHeight);
+            context.globalAlpha = Math.min(0.18, rgbSplit * 0.14);
+            drawCover(context, video, video.videoWidth, video.videoHeight, -width * 0.01 * rgbSplit, topHeight, width, bottomHeight);
+            context.globalAlpha = 1;
+            context.globalCompositeOperation = "source-over";
+          }
+          context.fillStyle = rgba(effectFilter.bottomHigh, audioBands.high * 0.14);
+          context.fillRect(0, topHeight, width, bottomHeight);
+          context.fillStyle = rgba(effectFilter.bottomBass, audioBands.bass * 0.12);
+          context.fillRect(0, topHeight, width, bottomHeight);
+          context.restore();
         }
-        context.fillStyle = rgba(effectFilter.bottomHigh, audioBands.high * 0.14);
-        context.fillRect(0, topHeight, width, bottomHeight);
-        context.fillStyle = rgba(effectFilter.bottomBass, audioBands.bass * 0.12);
-        context.fillRect(0, topHeight, width, bottomHeight);
-        context.restore();
       } else {
         context.fillStyle = "#050705";
         context.fillRect(0, 0, width, height);
       }
 
       if (canDrawVideo) {
-        context.fillStyle = "rgba(0, 0, 0, 0.8)";
-        context.fillRect(0, topHeight - 2, width, 4);
         drawModulationOverlays(context, width, height, audioBands, effectFilter, now);
       }
-
-      if (now - lastBandUiUpdateRef.current > 80) {
-        lastBandUiUpdateRef.current = now;
-        setBands(audioBands);
-      }
     },
-    [readAudioBands, resolveActiveFilter],
+    [interpolateFrames, resolveActiveFilter],
   );
 
   const loop = useCallback(
@@ -1011,52 +1164,12 @@ export function AsciiVideoPage() {
     rafRef.current = null;
   }, []);
 
-  const ensureAudioGraph = useCallback(async () => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    if (!audioContextRef.current) {
-      audioContextRef.current = new AudioContext();
-    }
-
-    if (!audioSourceRef.current) {
-      const context = audioContextRef.current;
-      const source = context.createMediaElementSource(video);
-      const analyser = context.createAnalyser();
-      const destination = context.createMediaStreamDestination();
-
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.38;
-      source.connect(analyser);
-      analyser.connect(context.destination);
-      analyser.connect(destination);
-
-      analyserRef.current = analyser;
-      audioDestinationRef.current = destination;
-      audioSourceRef.current = source;
-      frequencyDataRef.current = new Uint8Array(analyser.frequencyBinCount);
-    }
-
-    if (audioContextRef.current.state === "suspended") {
-      await audioContextRef.current.resume();
-    }
-  }, []);
-
-  const clearExportUrl = useCallback(() => {
-    if (exportUrlRef.current) {
-      URL.revokeObjectURL(exportUrlRef.current);
-      exportUrlRef.current = "";
-    }
-    setExportUrl("");
-  }, []);
-
   const handleFiles = useCallback(
     (files: FileList | null) => {
       const file = Array.from(files ?? []).find((nextFile) => nextFile.type.startsWith("video/"));
       if (!file) return;
 
       if (clipUrlRef.current) URL.revokeObjectURL(clipUrlRef.current);
-      clearExportUrl();
 
       const url = URL.createObjectURL(file);
       clipUrlRef.current = url;
@@ -1068,11 +1181,11 @@ export function AsciiVideoPage() {
 
       setClip(nextClip);
       setIsPlaying(false);
-      setRecordingState("idle");
+      setAnalysisResult(null);
+      setDisplayProgress({ status: "idle", progress: 0 });
       setBands(emptyBands);
       bandsRef.current = emptyBands;
       visualBandsRef.current = emptyBands;
-      previousFrequencyDataRef.current.fill(0);
       renderedFilterRef.current = activeFilterRef.current;
       filterCandidateRef.current = { id: activeFilterRef.current.id, since: performance.now() };
 
@@ -1086,7 +1199,7 @@ export function AsciiVideoPage() {
 
       window.requestAnimationFrame((now) => renderFrame(now));
     },
-    [clearExportUrl, renderFrame],
+    [renderFrame],
   );
 
   const togglePlayback = useCallback(async () => {
@@ -1094,7 +1207,6 @@ export function AsciiVideoPage() {
     if (!video || !clip?.ready) return;
 
     if (video.paused) {
-      await ensureAudioGraph();
       await video.play();
       setIsPlaying(true);
       startRenderLoop();
@@ -1105,7 +1217,7 @@ export function AsciiVideoPage() {
     setIsPlaying(false);
     stopRenderLoop();
     window.requestAnimationFrame((now) => renderFrame(now));
-  }, [clip?.ready, ensureAudioGraph, renderFrame, startRenderLoop, stopRenderLoop]);
+  }, [clip?.ready, renderFrame, startRenderLoop, stopRenderLoop]);
 
   const resetPlayback = useCallback(() => {
     const video = videoRef.current;
@@ -1116,7 +1228,6 @@ export function AsciiVideoPage() {
     setIsPlaying(false);
     bandsRef.current = emptyBands;
     visualBandsRef.current = emptyBands;
-    previousFrequencyDataRef.current.fill(0);
     renderedFilterRef.current = activeFilterRef.current;
     filterCandidateRef.current = { id: activeFilterRef.current.id, since: performance.now() };
     setBands(emptyBands);
@@ -1124,58 +1235,39 @@ export function AsciiVideoPage() {
     window.requestAnimationFrame((now) => renderFrame(now));
   }, [renderFrame, stopRenderLoop]);
 
-  const stopRecording = useCallback(() => {
-    const recorder = recorderRef.current;
-    if (!recorder || recorder.state === "inactive") return;
-
-    setRecordingState("stopping");
-    recorder.stop();
-  }, []);
-
-  const startRecording = useCallback(async () => {
+  const handleGeneratedFullscreen = useCallback(async () => {
     const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    try {
+      if (document.fullscreenElement === canvas) {
+        await document.exitFullscreen();
+        return;
+      }
+      fullscreenViewRef.current = "generated";
+      await canvas.requestFullscreen();
+      window.requestAnimationFrame((now) => renderFrame(now));
+    } catch {
+      fullscreenViewRef.current = null;
+      // Fullscreen can be rejected by browser policy; the canvas remains usable inline.
+    }
+  }, [renderFrame]);
+
+  const handleOriginalFullscreen = useCallback(async () => {
     const video = videoRef.current;
-    if (!canvas || !video || !clip?.ready) return;
+    if (!video) return;
 
-    await ensureAudioGraph();
-    clearExportUrl();
-    recordedChunksRef.current = [];
-    const stream = canvas.captureStream(30);
-    audioDestinationRef.current?.stream.getAudioTracks().forEach((track) => stream.addTrack(track));
-    const mimeType = getRecorderMimeType();
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) recordedChunksRef.current.push(event.data);
-    };
-    recorder.onstop = () => {
-      const blob = new Blob(recordedChunksRef.current, { type: mimeType || "video/webm" });
-      const url = URL.createObjectURL(blob);
-      exportUrlRef.current = url;
-      setExportUrl(url);
-      setRecordingState("idle");
-      stream.getTracks().forEach((track) => track.stop());
-    };
-
-    recorderRef.current = recorder;
-    recorder.start(500);
-    setRecordingState("recording");
-
-    if (video.paused) {
-      await video.play();
-      setIsPlaying(true);
-      startRenderLoop();
+    try {
+      if (document.fullscreenElement === video) {
+        await document.exitFullscreen();
+        return;
+      }
+      fullscreenViewRef.current = null;
+      await video.requestFullscreen();
+    } catch {
+      // Fullscreen can be rejected by browser policy; the inline original remains available.
     }
-  }, [clearExportUrl, clip?.ready, ensureAudioGraph, startRenderLoop]);
-
-  const toggleRecording = useCallback(() => {
-    if (recordingState === "recording") {
-      stopRecording();
-      return;
-    }
-
-    void startRecording();
-  }, [recordingState, startRecording, stopRecording]);
+  }, []);
 
   useEffect(() => {
     const handleResize = () => window.requestAnimationFrame((now) => renderFrame(now));
@@ -1184,18 +1276,86 @@ export function AsciiVideoPage() {
   }, [renderFrame]);
 
   useEffect(() => {
+    const handleFullscreenChange = () => {
+      if (document.fullscreenElement !== canvasRef.current) {
+        fullscreenViewRef.current = null;
+      }
+      window.requestAnimationFrame((now) => renderFrame(now));
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, [renderFrame]);
+
+  useEffect(() => {
     window.requestAnimationFrame((now) => renderFrame(now));
-  }, [activeFilterId, autoFilter, clip, contrast, density, profileFilterMap, reactivity, renderFrame, transitionSmooth]);
+  }, [
+    activeFilterId,
+    autoFilter,
+    clip,
+    contrast,
+    density,
+    frequencyFilterMap,
+    filterPolarityMap,
+    glyphMode,
+    overlayStrength,
+    pixelSize,
+    reactivity,
+    renderFrame,
+    sourceLevel,
+    transitionSmooth,
+    viewMode,
+  ]);
 
   useEffect(() => {
     return () => {
       stopRenderLoop();
-      recorderRef.current?.state === "recording" && recorderRef.current.stop();
       if (clipUrlRef.current) URL.revokeObjectURL(clipUrlRef.current);
-      if (exportUrlRef.current) URL.revokeObjectURL(exportUrlRef.current);
-      audioContextRef.current?.close();
     };
   }, [stopRenderLoop]);
+
+  const analyzeAndPrepare = useCallback(async () => {
+    const video = videoRef.current;
+    if (!video?.src) return;
+    const requestedSrc = video.src;
+    const initialProgress: AnalysisProgress = { status: "analyzing", progress: 0 };
+    setDisplayProgress(initialProgress);
+
+    const AudioContextClass = window.AudioContext ?? (window as WindowWithWebkit).webkitAudioContext;
+    if (!AudioContextClass) {
+      const errorProgress: AnalysisProgress = {
+        status: "error",
+        progress: 0,
+        error: "Web Audio API not supported",
+      };
+      setDisplayProgress(errorProgress);
+      return;
+    }
+    const audioCtx = new AudioContextClass();
+
+    try {
+      const response = await fetch(video.src);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const arrayBuffer = await response.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+      const result = await analyzeAudio(audioBuffer, (progress) => {
+        setDisplayProgress(progress);
+      });
+
+      if (videoRef.current?.src !== requestedSrc) return;
+      setAnalysisResult(result);
+      setDisplayProgress({ status: "idle", progress: 0 });
+    } catch (error) {
+      const errorProgress: AnalysisProgress = {
+        status: "error",
+        progress: 0,
+        error: error instanceof Error ? error.message : "Analysis failed",
+      };
+      setDisplayProgress(errorProgress);
+    } finally {
+      await audioCtx.close().catch(() => {});
+    }
+  }, []);
 
   const handleLoadedMetadata = useCallback(() => {
     const video = videoRef.current;
@@ -1210,21 +1370,21 @@ export function AsciiVideoPage() {
         ready: true,
       };
     });
+    void analyzeAndPrepare();
     window.requestAnimationFrame((now) => renderFrame(now));
-  }, [renderFrame]);
+  }, [renderFrame, analyzeAndPrepare]);
 
   const handleVideoError = useCallback(() => {
     setClip((currentClip) => {
       if (!currentClip) return currentClip;
-      return { ...currentClip, error: "영상을 읽을 수 없습니다.", ready: false };
+      return { ...currentClip, error: "Unable to read this video.", ready: false };
     });
   }, []);
 
   const handleEnded = useCallback(() => {
     setIsPlaying(false);
     stopRenderLoop();
-    if (recordingState === "recording") stopRecording();
-  }, [recordingState, stopRecording, stopRenderLoop]);
+  }, [stopRenderLoop]);
 
   const clipStatus = clip?.error
     ? clip.error
@@ -1239,7 +1399,7 @@ export function AsciiVideoPage() {
     <main className="ascii-shell">
       <section className="ascii-workspace" aria-label="ASCII video workspace">
         <aside className="ascii-control-panel">
-          <a className="page-link" href="/">
+          <a className="page-link" href="/gesture">
             <Sparkles size={15} aria-hidden="true" />
             Gesture Scrub
           </a>
@@ -1255,36 +1415,34 @@ export function AsciiVideoPage() {
             }}
           />
 
-          <button className="upload-zone ascii-upload-zone" type="button" onClick={() => fileInputRef.current?.click()}>
-            <Upload size={18} aria-hidden="true" />
-            <span>영상 업로드</span>
-            <small>{clipStatus}</small>
+          <button
+            className={`upload-zone ascii-upload-zone${clip ? " has-clip" : ""}${clip?.error ? " has-error" : ""}`}
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            {clip ? <FileVideo size={18} aria-hidden="true" /> : <Upload size={18} aria-hidden="true" />}
+            <span>{clip?.name ?? "Upload Video"}</span>
+            <small>{clip ? `${clipStatus} · click to replace` : clipStatus}</small>
           </button>
+
+          {displayProgress.status === "analyzing" && (
+            <div className="analysis-progress">
+              Analyzing... {Math.round(displayProgress.progress * 100)}%
+            </div>
+          )}
+          {displayProgress.status === "error" && (
+            <div className="analysis-error">{displayProgress.error}</div>
+          )}
 
           <div className="ascii-transport">
             <button className="primary" type="button" onClick={togglePlayback} disabled={!canUseClip}>
               {isPlaying ? <Pause size={17} aria-hidden="true" /> : <Play size={17} aria-hidden="true" />}
-              {isPlaying ? "정지" : "재생"}
+              {isPlaying ? "Pause" : "Play"}
             </button>
             <button type="button" onClick={resetPlayback} disabled={!clip}>
               <RotateCcw size={17} aria-hidden="true" />
-              처음
+              Restart
             </button>
-            <button
-              className="record-button"
-              type="button"
-              onClick={toggleRecording}
-              disabled={!canUseClip || recordingState === "stopping"}
-            >
-              <Radio size={17} aria-hidden="true" />
-              {recordingState === "recording" ? "녹화 종료" : "WebM 녹화"}
-            </button>
-            {exportUrl ? (
-              <a className="download-link" href={exportUrl} download="audio-reactive-ascii.webm">
-                <Download size={16} aria-hidden="true" />
-                결과 받기
-              </a>
-            ) : null}
           </div>
 
           <div className="ascii-panel-group">
@@ -1303,7 +1461,7 @@ export function AsciiVideoPage() {
               </button>
               <span>{autoFilter ? activeFilter.reason : "manual lock"}</span>
             </div>
-            <div className="mode-segments filter-segments" aria-label="ASCII effect filter">
+            <div className="mode-segments" aria-label="ASCII effect filter">
               {effectFilters.map((filter) => (
                 <button
                   key={filter.id}
@@ -1312,7 +1470,11 @@ export function AsciiVideoPage() {
                   onClick={() => {
                     setAutoFilter(false);
                     activeFilterRef.current = filter;
-                    settingsRef.current = { ...settingsRef.current, filter };
+                    settingsRef.current = {
+                      ...settingsRef.current,
+                      filter,
+                      polarity: filterPolarityMap[filter.id],
+                    };
                     setActiveFilterId(filter.id);
                   }}
                 >
@@ -1320,25 +1482,61 @@ export function AsciiVideoPage() {
                 </button>
               ))}
             </div>
+            <div className="relief-route-grid" aria-label="Per-preset polarity settings">
+              {effectFilters.map((filter) => (
+                <div key={filter.id} className="relief-route-row">
+                  <span>{filter.label}</span>
+                  <div className="relief-toggle" role="group" aria-label={`${filter.label} polarity`}>
+                    {polarityOptions.map((option) => (
+                      <button
+                        key={option.value}
+                        className={filterPolarityMap[filter.id] === option.value ? "active" : ""}
+                        type="button"
+                        aria-pressed={filterPolarityMap[filter.id] === option.value}
+                        onClick={() => {
+                          setFilterPolarityMap((currentMap) => {
+                            const nextMap = {
+                              ...currentMap,
+                              [filter.id]: option.value,
+                            };
+                            filterPolarityMapRef.current = nextMap;
+                            return nextMap;
+                          });
+                          if (activeFilterId === filter.id || renderedFilterRef.current.id === filter.id) {
+                            settingsRef.current = {
+                              ...settingsRef.current,
+                              polarity: option.value,
+                            };
+                          }
+                          window.requestAnimationFrame((now) => renderFrame(now));
+                        }}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="ascii-panel-group">
             <div className="panel-title">
               <SlidersHorizontal size={15} aria-hidden="true" />
-              <h2>Profile Routing</h2>
+              <h2>Frequency Routing</h2>
             </div>
-            <div className="profile-route-grid" aria-label="Audio profile filter routing">
-              {profileOptions.map((option) => (
-                <label key={option.profile} className="profile-route-row">
+            <div className="frequency-route-grid" aria-label="Frequency filter routing">
+              {frequencyRouteOptions.map((option) => (
+                <label key={option.band} className="frequency-route-row">
                   <span>{option.label}</span>
                   <select
-                    value={profileFilterMap[option.profile]}
+                    value={frequencyFilterMap[option.band]}
                     onChange={(event) => {
                       const nextFilterId = event.target.value as EffectFilterId;
                       setAutoFilter(true);
-                      setProfileFilterMap((currentMap) => ({
+                      setFrequencyFilterMap((currentMap) => ({
                         ...currentMap,
-                        [option.profile]: nextFilterId,
+                        [option.band]: nextFilterId,
                       }));
                     }}
                   >
@@ -1354,6 +1552,24 @@ export function AsciiVideoPage() {
           </div>
 
           <div className="ascii-panel-group">
+            <div className="mode-segments render-segments" aria-label="ASCII render mode">
+              <button
+                className={viewMode === "split" ? "active" : ""}
+                type="button"
+                aria-pressed={viewMode === "split"}
+                onClick={() => setViewMode("split")}
+              >
+                Split
+              </button>
+              <button
+                className={viewMode === "overlay" ? "active" : ""}
+                type="button"
+                aria-pressed={viewMode === "overlay"}
+                onClick={() => setViewMode("overlay")}
+              >
+                Overlay
+              </button>
+            </div>
             <label className="range-row">
               <span>React</span>
               <input
@@ -1365,6 +1581,30 @@ export function AsciiVideoPage() {
                 onChange={(event) => setReactivity(Number(event.target.value))}
               />
               <strong>{Math.round(reactivity * 100)}%</strong>
+            </label>
+            <label className="range-row">
+              <span>Layer</span>
+              <input
+                max="1"
+                min="0.25"
+                step="0.01"
+                type="range"
+                value={overlayStrength}
+                onChange={(event) => setOverlayStrength(Number(event.target.value))}
+              />
+              <strong>{Math.round(overlayStrength * 100)}%</strong>
+            </label>
+            <label className="range-row">
+              <span>Source</span>
+              <input
+                max="1"
+                min="0.35"
+                step="0.01"
+                type="range"
+                value={sourceLevel}
+                onChange={(event) => setSourceLevel(Number(event.target.value))}
+              />
+              <strong>{Math.round(sourceLevel * 100)}%</strong>
             </label>
             <label className="range-row">
               <span>Smooth</span>
@@ -1389,6 +1629,32 @@ export function AsciiVideoPage() {
                 onChange={(event) => setDensity(Number(event.target.value))}
               />
               <strong>{Math.round(density * 100)}%</strong>
+            </label>
+            <label className="range-row">
+              <span>Pixel</span>
+              <input
+                max="1"
+                min="0"
+                step="0.01"
+                type="range"
+                value={pixelSize}
+                onChange={(event) => setPixelSize(Number(event.target.value))}
+              />
+              <strong>{Math.round(pixelSize * 100)}%</strong>
+            </label>
+            <label className="select-row">
+              <span>Glyph</span>
+              <select
+                value={glyphMode}
+                onChange={(event) => setGlyphMode(event.target.value as GlyphMode)}
+              >
+                {glyphModeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <strong>{getGlyphModeLabel(resolveGlyphMode(glyphMode, activeFilterId))}</strong>
             </label>
             <label className="range-row">
               <span>Contrast</span>
@@ -1428,13 +1694,6 @@ export function AsciiVideoPage() {
             ))}
           </div>
 
-          <div className="clip-status" aria-label="현재 영상">
-            <FileVideo size={15} aria-hidden="true" />
-            <span>
-              <strong>{clip?.name ?? "업로드한 영상이 없습니다."}</strong>
-              <em>{clipStatus}</em>
-            </span>
-          </div>
         </aside>
 
         <section className="ascii-main-panel">
@@ -1457,13 +1716,29 @@ export function AsciiVideoPage() {
                 <strong>Audio Reactive ASCII</strong>
               </div>
             ) : null}
+            {clip && viewMode === "split" ? (
+              <>
+                <button
+                  className="stage-hit stage-hit-generated"
+                  type="button"
+                  onClick={handleGeneratedFullscreen}
+                >
+                  <span>Generated Fullscreen</span>
+                </button>
+                <button
+                  className="stage-hit stage-hit-original"
+                  type="button"
+                  onClick={handleOriginalFullscreen}
+                >
+                  <span>Source Fullscreen</span>
+                </button>
+              </>
+            ) : null}
             <div className="ascii-stage-hud">
               <span>{clip?.name ?? "No clip"}</span>
-              <span>
-                {recordingState === "recording"
-                  ? "recording"
-                  : `${autoFilter ? "auto" : "manual"} · ${activeFilter.label}`}
-              </span>
+              <span>{displayProgress.status === "analyzing"
+                ? `analyzing ${Math.round(displayProgress.progress * 100)}%`
+                : `${autoFilter ? "auto" : "manual"} · ${activeFilter.label}`}</span>
             </div>
           </div>
         </section>

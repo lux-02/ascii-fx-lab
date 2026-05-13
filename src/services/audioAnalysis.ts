@@ -180,6 +180,6 @@ export async function analyzeAudio(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     onProgress?.({ status: "error", progress: 0, error: errorMessage });
-    throw new Error(`오디오 분석 실패: ${errorMessage}`);
+    throw new Error(`Audio analysis failed: ${errorMessage}`);
   }
 }
