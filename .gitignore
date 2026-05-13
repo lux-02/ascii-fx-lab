@@ -13,3 +13,4 @@ reelgesture-*.png
 *.m4v
 varco-assets/
 public/models/
+.vercel
